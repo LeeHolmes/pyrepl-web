@@ -286,6 +286,24 @@ function getConsoleCode(): Promise<string> {
   return consoleCodePromise;
 }
 
+function isInputDebugEnabled(): boolean {
+  const searchParams = new URLSearchParams(window.location.search);
+  return searchParams.get("debug") === "1";
+}
+
+function formatDebugText(value: string | null | undefined): string {
+  if (value == null) {
+    return "<null>";
+  }
+  return JSON.stringify(value);
+}
+
+function formatDebugCodes(value: string): string {
+  return Array.from(value)
+    .map((char) => char.charCodeAt(0))
+    .join(",");
+}
+
 export class PyReplEmbed {
   private container: HTMLElement;
   private theme: string;
@@ -436,6 +454,15 @@ function injectStyles() {
       scrollbar-width: none;
       background-color: var(--pyrepl-bg) !important;
     }
+
+    /* Make xterm's built-in IME composition overlay invisible.
+       We do live preview ourselves via Python readline, so the overlay
+       would double-render the in-progress text over our highlighted output.
+       Using opacity:0 keeps the element in the DOM/layout so the IME still
+       treats it as a live target (display:none breaks Samsung IME). */
+    .pyrepl .xterm .composition-view {
+      opacity: 0 !important;
+    }
   `;
   document.head.appendChild(style);
 }
@@ -526,6 +553,85 @@ async function createTerminal(
     disableStdin: config.readonly,
   });
   term.open(termContainer);
+
+  // Option #1: email input mode for no auto-caps, plus suggestion-reduction hints.
+  const applyKeyboardHints = () => {
+    const textarea = termContainer.querySelector(
+      ".xterm-helper-textarea",
+    ) as HTMLTextAreaElement | null;
+    if (!textarea) {
+      return;
+    }
+
+    textarea.autocapitalize = "off";
+    textarea.setAttribute("autocapitalize", "off");
+    textarea.inputMode = "email";
+    textarea.setAttribute("inputmode", "email");
+    textarea.autocomplete = "off";
+    textarea.setAttribute("autocomplete", "off");
+    textarea.setAttribute("autocorrect", "off");
+    textarea.spellcheck = false;
+    textarea.setAttribute("spellcheck", "false");
+    textarea.name = "password";
+    textarea.setAttribute("name", "password");
+
+    if (
+      isInputDebugEnabled() &&
+      textarea.dataset.pyreplDebugAttached !== "true"
+    ) {
+      textarea.dataset.pyreplDebugAttached = "true";
+
+      const logTextareaEvent = (
+        type: string,
+        details: Record<string, string | number | boolean | null>,
+      ) => {
+        console.log("[pyrepl-input]", type, details);
+      };
+
+      textarea.addEventListener("compositionstart", () => {
+        logTextareaEvent("compositionstart", {
+          value: textarea.value,
+          selectionStart: textarea.selectionStart,
+          selectionEnd: textarea.selectionEnd,
+        });
+      });
+
+      textarea.addEventListener("compositionupdate", (event) => {
+        logTextareaEvent("compositionupdate", {
+          data: event.data,
+          value: textarea.value,
+          selectionStart: textarea.selectionStart,
+          selectionEnd: textarea.selectionEnd,
+        });
+      });
+
+      textarea.addEventListener("compositionend", (event) => {
+        logTextareaEvent("compositionend", {
+          data: event.data,
+          value: textarea.value,
+          selectionStart: textarea.selectionStart,
+          selectionEnd: textarea.selectionEnd,
+        });
+      });
+
+      textarea.addEventListener("input", (event) => {
+        const inputEvent = event as InputEvent;
+        logTextareaEvent("input", {
+          data: inputEvent.data,
+          inputType: inputEvent.inputType,
+          isComposing: inputEvent.isComposing,
+          value: textarea.value,
+          selectionStart: textarea.selectionStart,
+          selectionEnd: textarea.selectionEnd,
+        });
+      });
+    }
+  };
+
+  applyKeyboardHints();
+  new MutationObserver(() => {
+    applyKeyboardHints();
+  }).observe(termContainer, { childList: true, subtree: true });
 
   // Calculate size based on actual rendered character dimensions
   const calculateSize = () => {
@@ -666,9 +772,56 @@ async function createRepl(
 
   // Only attach input handler if not readonly
   if (!config.readonly) {
-    // Buffer to track what we've sent to Python (for filtering composition replays)
+    // Buffer to track what we've sent to Python
     let sentBuffer = "";
-    let lastCompositionPart = ""; // Track what we extracted from last composition replay
+    let lastTextEvent = "";
+    let lastTextEventAt = 0;
+    const inputDebugEnabled = isInputDebugEnabled();
+    let imePreviewText = "";
+    // Text already sent to Python via composition preview that must be stripped
+    // from the subsequent xterm onData commit event.
+    let compositionSentText = "";
+    // True until the first compositionupdate fires after compositionstart.
+    // Used to detect retroactive compositions (e.g. SwiftKey suggestion overlay
+    // that starts after chars were already individually typed via onData).
+    let isFirstCompositionUpdate = false;
+
+    // Takes a snapshot of the previous event so the caller can update
+    // lastTextEvent before calling (important for early-return paths).
+    const normalizeTextInput = (
+      data: string,
+      prevEvent: string,
+      prevEventAt: number,
+      now: number,
+    ): string => {
+      if (now - prevEventAt >= 50) {
+        return data;
+      }
+
+      // Samsung keyboard replays single punctuation onData events (e.g. ", , )).
+      // Drop only single non-alphanumeric replays to avoid eating intentional
+      // repeated letters/numbers.
+      const isSingleNonAlnum =
+        data.length === 1 && /[^a-zA-Z0-9]/.test(data);
+      if (data === prevEvent && isSingleNonAlnum) {
+        return "";
+      }
+
+      // Leave ordinary single-key typing alone after filtering exact replays;
+      // only normalize payloads that look like cumulative IME text.
+      if (prevEvent.length <= 1 && data.length <= 1) {
+        return data;
+      }
+
+      const maxOverlap = Math.min(prevEvent.length, data.length);
+      for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+        if (prevEvent.slice(-overlap) === data.slice(0, overlap)) {
+          return data.slice(overlap);
+        }
+      }
+
+      return data;
+    };
 
     // Handle Ctrl+C for copy and Ctrl+V for paste
     term.attachCustomKeyEventHandler((event: KeyboardEvent) => {
@@ -697,79 +850,235 @@ async function createRepl(
       return true; // Let xterm handle other keys
     });
 
-    term.onData((data: string) => {
-      // Filter mobile keyboard auto-space after punctuation
-      // If data is quote+space, dot+space, comma+space, or paren+space, drop the space
-      if (data === '" ' || data === ". " || data === ", " || data === ") ") {
-        data = data[0] as string;
+    const helperTextarea = replContainer.querySelector(
+      ".xterm-helper-textarea",
+    ) as HTMLTextAreaElement | null;
+
+    const applyCompositionPreview = (nextText: string) => {
+      const prevText = imePreviewText;
+      let commonPrefix = 0;
+      const maxCommon = Math.min(prevText.length, nextText.length);
+      while (
+        commonPrefix < maxCommon &&
+        prevText[commonPrefix] === nextText[commonPrefix]
+      ) {
+        commonPrefix += 1;
       }
 
-      // Skip if this is a duplicate of what we just sent via composition replay
-      if (lastCompositionPart) {
-        if (data === lastCompositionPart) {
-          // Exact match - skip and clear
-          lastCompositionPart = "";
-          return;
+      const removeCount = prevText.length - commonPrefix;
+      const addText = nextText.slice(commonPrefix);
+
+      for (let i = 0; i < removeCount; i += 1) {
+        browserConsole.push_char("\x7f".charCodeAt(0));
+        if (sentBuffer.length > 0) {
+          sentBuffer = sentBuffer.slice(0, -1);
         }
-        if (lastCompositionPart.startsWith(data)) {
-          // Partial match (e.g., "," matches ", ") - skip and remember remainder
-          lastCompositionPart = lastCompositionPart.slice(data.length);
-          return;
-        }
-        // No match - clear and continue
-        lastCompositionPart = "";
       }
 
-      // Filter mobile keyboard composition replay
-      // If data is >1 char and starts with what we've already sent, only send the new part
-      if (data.length > 1 && sentBuffer.length > 0) {
-        // Check if data starts with our buffer (exact match)
-        const startsWithBuffer = data.startsWith(sentBuffer);
-        if (startsWithBuffer) {
-          // Only send the new characters (after the buffer content)
-          const newPart = data.slice(sentBuffer.length);
-          lastCompositionPart = newPart; // Remember to skip duplicate
-          if (newPart) {
-            for (const char of newPart) {
-              browserConsole.push_char(char.charCodeAt(0));
-              const code = char.charCodeAt(0);
-              if (code >= 32 && code < 127) {
-                sentBuffer += char;
-              }
-            }
+      for (const char of addText) {
+        browserConsole.push_char(char.charCodeAt(0));
+        const code = char.charCodeAt(0);
+        if (code >= 32 && code < 127) {
+          sentBuffer += char;
+        }
+      }
+
+      imePreviewText = nextText;
+
+      if (inputDebugEnabled) {
+        console.log("[pyrepl-input] composition-preview", {
+          prev: formatDebugText(prevText),
+          next: formatDebugText(nextText),
+          removed: removeCount,
+          added: formatDebugText(addText),
+          sentBuffer,
+        });
+      }
+    };
+
+    if (helperTextarea) {
+      helperTextarea.addEventListener("compositionstart", () => {
+        imePreviewText = "";
+        compositionSentText = "";
+        isFirstCompositionUpdate = true;
+      });
+
+      helperTextarea.addEventListener("compositionupdate", (event) => {
+        const composedText = event.data ?? "";
+
+        // Retroactive composition detection: SwiftKey and some other keyboards
+        // type characters one-at-a-time via onData, then start a composition
+        // overlay over the already-committed word (e.g. for suggestion display).
+        // The first compositionupdate will carry the full word (>1 char) which
+        // is already at the tail of sentBuffer. If so, seed imePreviewText with
+        // that text so applyCompositionPreview sees a zero diff and sends nothing.
+        if (
+          isFirstCompositionUpdate &&
+          composedText.length > 1 &&
+          sentBuffer.endsWith(composedText)
+        ) {
+          isFirstCompositionUpdate = false;
+          imePreviewText = composedText;
+          compositionSentText = imePreviewText;
+          if (inputDebugEnabled) {
+            console.log("[pyrepl-input] composition-retroactive", {
+              composedText: formatDebugText(composedText),
+              sentBuffer,
+            });
           }
           return;
         }
+        isFirstCompositionUpdate = false;
+
+        applyCompositionPreview(composedText);
+        // Keep compositionSentText current so it's always ready before onData
+        // fires, regardless of whether compositionend has run yet.
+        compositionSentText = imePreviewText;
+      });
+
+      helperTextarea.addEventListener("compositionend", () => {
+        compositionSentText = imePreviewText;
+        imePreviewText = "";
+      });
+    }
+
+    term.onData((data: string) => {
+      const now = Date.now();
+      const rawData = data;
+      let decision = "forward";
+
+      if (inputDebugEnabled) {
+        console.log("[pyrepl-input] onData-entry", {
+          raw: formatDebugText(rawData),
+          rawCodes: formatDebugCodes(rawData),
+          compositionSentText: formatDebugText(compositionSentText),
+          lastTextEvent: formatDebugText(lastTextEvent),
+        });
       }
 
-      // Handle backspace BEFORE sending - update buffer first
+      // Snapshot previous event state BEFORE updating, so normalizeTextInput
+      // can compare against the truly previous payload even on early-return paths.
+      const prevLastTextEvent = lastTextEvent;
+      const prevLastTextEventAt = lastTextEventAt;
+      // Always advance tracking so any subsequent duplicate onData is caught by
+      // normalizeTextInput's overlap check, even if we return early below.
+      lastTextEvent = rawData;
+      lastTextEventAt = now;
+
+      // Strip composition text already sent to Python via live preview.
+      if (compositionSentText) {
+        if (data.startsWith(compositionSentText)) {
+          data = data.slice(compositionSentText.length);
+          decision = "strip-composition";
+          compositionSentText = "";
+        } else if (compositionSentText.startsWith(data)) {
+          compositionSentText = compositionSentText.slice(data.length);
+          decision = "strip-composition-partial";
+          data = "";
+        } else {
+          // Mismatch — xterm sent something unexpected; reset and forward as-is.
+          compositionSentText = "";
+        }
+      }
+
+      if (!data) {
+        if (inputDebugEnabled) {
+          console.log("[pyrepl-input] onData", {
+            raw: formatDebugText(rawData),
+            rawCodes: formatDebugCodes(rawData),
+            decision,
+            sentBuffer,
+          });
+        }
+        return;
+      }
+
+      // For 2-char inputs, trim keyboard auto-inserted trailing whitespace
+      // (e.g. ", " -> ",").
+      if (data.length === 2) {
+        const trimmed = data.trim();
+        if (trimmed.length === 1) {
+          data = trimmed;
+          decision = "trim-whitespace";
+        }
+      }
+
+      // Handle backspace - update buffer first
       if (data === "\x7f" || data === "\x08") {
         browserConsole.push_char(data.charCodeAt(0));
         if (sentBuffer.length > 0) {
           sentBuffer = sentBuffer.slice(0, -1);
+        }
+        if (inputDebugEnabled) {
+          console.log("[pyrepl-input] onData", {
+            raw: formatDebugText(rawData),
+            rawCodes: formatDebugCodes(rawData),
+            decision: "backspace",
+            sentBuffer,
+          });
         }
         return;
       }
 
       // Clear buffer on line-ending events (Enter, Ctrl+C, ESC)
       if (data === "\r" || data === "\x03" || data === "\x1b") {
-        for (const char of data) {
-          browserConsole.push_char(char.charCodeAt(0));
-        }
+        browserConsole.push_char(data.charCodeAt(0));
         sentBuffer = "";
+        if (inputDebugEnabled) {
+          console.log("[pyrepl-input] onData", {
+            raw: formatDebugText(rawData),
+            rawCodes: formatDebugCodes(rawData),
+            decision: "control",
+            sentBuffer,
+          });
+        }
         return;
       }
 
-      // Send to Python and track what we sent
-      // Don't add escape sequences to buffer (they're cursor movement, not text input)
-      const isEscapeSequence = data.startsWith("\x1b");
-      for (const char of data) {
+      const normalizedData = normalizeTextInput(
+        data,
+        prevLastTextEvent,
+        prevLastTextEventAt,
+        now,
+      );
+
+      if (!normalizedData) {
+        if (inputDebugEnabled) {
+          console.log("[pyrepl-input] onData", {
+            raw: formatDebugText(rawData),
+            rawCodes: formatDebugCodes(rawData),
+            normalized: formatDebugText(normalizedData),
+            decision: "drop-duplicate",
+            prevLastTextEvent: formatDebugText(prevLastTextEvent),
+            sentBuffer,
+          });
+        }
+        return;
+      }
+
+      // Mobile IMEs can commit multiple characters in one xterm event.
+      // Forward every character so readline redraws through the highlighter.
+      for (const char of normalizedData) {
         browserConsole.push_char(char.charCodeAt(0));
-        // Only add printable chars (32-126) to buffer, skip escape sequences and control chars
         const code = char.charCodeAt(0);
-        if (!isEscapeSequence && code >= 32 && code < 127) {
+        if (code >= 32 && code < 127) {
           sentBuffer += char;
         }
+      }
+
+      if (inputDebugEnabled) {
+        if (normalizedData !== data && decision === "forward") {
+          decision = "overlap-trim";
+        }
+        console.log("[pyrepl-input] onData", {
+          raw: formatDebugText(rawData),
+          rawCodes: formatDebugCodes(rawData),
+          normalized: formatDebugText(normalizedData),
+          normalizedCodes: formatDebugCodes(normalizedData),
+          decision,
+          prevLastTextEvent: formatDebugText(prevLastTextEvent),
+          sentBuffer,
+        });
       }
     });
 

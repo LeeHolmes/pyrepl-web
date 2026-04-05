@@ -208,8 +208,8 @@ async def start_repl():
         except Exception as e:
             browser_console.term.write(f"[ERROR] Pygments load failed: {e}\r\n")
 
-    # Start loading Pygments in background (non-blocking)
-    asyncio.create_task(load_pygments())
+    # Load Pygments before accepting input so highlighting is available immediately.
+    await load_pygments()
 
     def syntax_highlight(code):
         if not code:
@@ -432,10 +432,10 @@ async def start_repl():
                     browser_console.term.write(output)
                 continue
             
-            # Regular character - insert at cursor
-            if len(char) == 1 and ord(char) >= 32:
+            # Regular text input - mobile IMEs may commit multiple characters at once
+            if char and all(ord(ch) >= 32 for ch in char):
                 current_line = current_line[:cursor_pos] + char + current_line[cursor_pos:]
-                cursor_pos += 1
+                cursor_pos += len(char)
                 output = "\r\x1b[K" + prompt + highlight(current_line)
                 if cursor_pos < len(current_line):
                     output += f"\x1b[{len(current_line) - cursor_pos}D"
